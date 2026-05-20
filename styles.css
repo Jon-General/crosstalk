@@ -151,6 +151,26 @@ select:disabled {
   margin-left: 8px;
 }
 
+.top-tabs {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.tab-btn {
+  border-radius: 999px;
+  border: 1px solid #2d4058;
+  background: #162233;
+  color: #a7bdd6;
+  padding: 7px 12px;
+  font-size: 0.82rem;
+}
+
+.tab-btn.active {
+  background: #244462;
+  border-color: #4f7da6;
+  color: #dff2ff;
+}
+
 .menu-toggle {
   background: transparent;
   border: 1px solid transparent;
@@ -208,10 +228,6 @@ select:disabled {
   color: #dff2ff;
 }
 
-.mode-btn.subtle {
-  margin-left: auto;
-}
-
 .hidden-upload {
   display: none;
 }
@@ -248,6 +264,101 @@ select:disabled {
   min-width: 0;
 }
 
+.studio-pane {
+  padding: 16px;
+  overflow-y: auto;
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.studio-card {
+  border: 1px solid var(--assistant-line);
+  background: var(--assistant);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.studio-card h3 {
+  margin: 0;
+  font-size: 1.02rem;
+}
+
+.studio-note {
+  margin: 8px 0 0;
+  color: #9eb2ca;
+  font-size: 0.88rem;
+}
+
+.studio-actions {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.studio-meta {
+  margin: 10px 0 0;
+  font-size: 0.86rem;
+  color: #d2deef;
+}
+
+.studio-meta.muted {
+  color: #88a0ba;
+}
+
+.studio-result {
+  margin-top: 12px;
+  border-top: 1px dashed #3b4f66;
+  padding-top: 10px;
+}
+
+.studio-result p {
+  margin: 0 0 6px;
+}
+
+.studio-result ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+
+.studio-link-wrap {
+  margin: 12px 0 0;
+}
+
+.studio-progress {
+  margin-top: 10px;
+  border: 1px solid #31506f;
+  background: #132235;
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #cfe2ff;
+  font-size: 0.86rem;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(200, 225, 255, 0.3);
+  border-top-color: #90c3ff;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .message {
   max-width: min(86%, 760px);
   border-radius: 14px;
@@ -279,6 +390,52 @@ select:disabled {
 
 .message.tutor.pending {
   color: #9ab0c8;
+}
+
+.message.file-message {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.file-pill {
+  min-width: 44px;
+  text-align: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border-radius: 8px;
+  padding: 4px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.file-content {
+  min-width: 0;
+}
+
+.file-name {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.file-meta,
+.file-link-label {
+  margin: 2px 0 0;
+  font-size: 0.82rem;
+  color: #9fb6ce;
+}
+
+.file-link {
+  color: #87cfff;
+  text-decoration: none;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.file-link:hover {
+  text-decoration: underline;
 }
 
 .citations {
@@ -440,6 +597,15 @@ ruby.word rt {
     gap: 6px;
   }
 
+  .top-tabs {
+    gap: 6px;
+  }
+
+  .tab-btn {
+    padding: 6px 10px;
+    font-size: 0.76rem;
+  }
+
   .composer-level {
     grid-column: 1 / span 2;
   }
@@ -459,14 +625,6 @@ ruby.word rt {
 
   .menu-modes {
     gap: 6px;
-  }
-
-  .mode-btn.subtle {
-    margin-left: 0;
-  }
-
-  .menu-tools button {
-    flex: 1 1 48%;
   }
 
   .doc-chip {

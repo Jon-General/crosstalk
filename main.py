@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import unicodedata
 from io import BytesIO
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
@@ -16,6 +17,7 @@ from pypdf import PdfReader
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.pdfmetrics import registerFont
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 load_dotenv()
@@ -29,6 +31,19 @@ WEB_USER_AGENT = "Mozilla/5.0 (compatible; CrosstalkTutor/0.2; +https://example.
 DOCUMENT_STORE: dict[str, dict[str, Any]] = {}
 
 registerFont(UnicodeCIDFont("STSong-Light"))
+
+PINYIN_FONT = "Helvetica"
+for font_path in (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+):
+    if os.path.exists(font_path):
+        try:
+            registerFont(TTFont("PinyinUnicode", font_path))
+            PINYIN_FONT = "PinyinUnicode"
+            break
+        except Exception:
+            continue
 
 
 @app.get("/api/health")
@@ -173,7 +188,7 @@ async def pdf_extract(file: UploadFile = File(...)):
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Could not read text file: {exc}")
 
-        cleaned = clean_text(text)
+        cleaned = clean_document_text(text)
         if not cleaned:
             raise HTTPException(status_code=400, detail="No extractable text found in file.")
 
@@ -183,7 +198,7 @@ async def pdf_extract(file: UploadFile = File(...)):
             "name": name,
             "pages": pages,
             "chars": len(cleaned),
-            "text": cleaned[:180000],
+            "text": cleaned[:450000],
         }
 
         return {
@@ -191,7 +206,7 @@ async def pdf_extract(file: UploadFile = File(...)):
             "name": name,
             "pages": pages,
             "chars": len(cleaned),
-            "preview": cleaned[:500],
+            "preview": clean_text(cleaned)[:500],
         }
 
 
@@ -294,6 +309,277 @@ async def pdf_graded_reader(request: Request):
         return result
 
 
+@app.post("/api/pdf/graded-reader-book")
+async def pdf_graded_reader_book(request: Request):
+        body = await request.json()
+        doc_id = clean_text(body.get("documentId", ""))
+        level = normalize_level(body.get("level"))
+        objective = clean_text(body.get("objective", ""))
+
+        document = DOCUMENT_STORE.get(doc_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found. Upload again.")
+
+        if not DEEPSEEK_API_KEY:
+            raise HTTPException(status_code=503, detail="DeepSeek API key is not configured on the server.")
+
+        sections = split_document_sections(document.get("text", ""))
+        if not sections:
+            raise HTTPException(status_code=400, detail="Could not split document into readable sections.")
+
+        max_sections = 24
+        truncated = len(sections) > max_sections
+        sections = sections[:max_sections]
+
+        chapter_results: list[dict[str, Any]] = []
+        for idx, section in enumerate(sections):
+            section_title = section.get("title") or f"Section {idx + 1}"
+            section_text = section.get("text", "")
+            if not section_text:
+                continue
+
+            prompt_payload = {
+                "task": "Create one chapter of a graded reader from source text.",
+                "level": level,
+                "objective": objective or "make a complete beginner-friendly graded reader",
+                "chapter_index": idx + 1,
+                "chapter_title_hint": section_title,
+                "schema": {
+                    "chapter_title": "short Chinese chapter title",
+                    "chapter_summary_en": "2-4 sentence English summary",
+                    "graded_lines": ["short Chinese lines for this chapter, 12-36 total"],
+                    "glossary": [{"term": "汉字词", "explain_en": "brief explanation"}],
+                    "notes": ["short note for difficult points"],
+                },
+                "constraints": [
+                    "Be faithful to source meaning.",
+                    "Keep language at requested HSK level.",
+                    "Write enough lines to cover this section; do not collapse to tiny summary.",
+                    "Return only valid JSON.",
+                ],
+                "source": section_text[:18000],
+            }
+
+            parsed: dict[str, Any]
+            used_fallback = False
+            try:
+                parsed = await request_deepseek_json(prompt_payload, max_tokens=2200)
+            except HTTPException as exc:
+                if is_content_exists_risk_error(exc.detail):
+                    parsed = build_fallback_section_payload(section_title, section_text, level)
+                    used_fallback = True
+                else:
+                    raise
+
+            chapter_lines = [clean_text(x) for x in parsed.get("graded_lines", []) if clean_text(x)][:42]
+            if not chapter_lines:
+                chapter_lines = ["我们继续读这一章。", "先看主要内容，再看细节。"]
+
+            chapter_results.append(
+                {
+                    "title": clean_text(parsed.get("chapter_title", section_title))[:120],
+                    "summary_en": clean_text(parsed.get("chapter_summary_en", ""))[:800],
+                    "graded_lines": chapter_lines,
+                    "graded_token_lines": [{"tokens": tokenize_chinese_line(line)} for line in chapter_lines],
+                    "glossary": [
+                        {
+                            "term": clean_text(item.get("term", ""))[:80],
+                            "explain_en": clean_text(item.get("explain_en", ""))[:220],
+                        }
+                        for item in parsed.get("glossary", [])
+                        if isinstance(item, dict) and clean_text(item.get("term", ""))
+                    ][:16],
+                    "notes": [clean_text(x) for x in parsed.get("notes", []) if clean_text(x)][:8],
+                    "source_chars": len(section_text),
+                    "fallback": used_fallback,
+                }
+            )
+
+        if not chapter_results:
+            raise HTTPException(status_code=500, detail="No chapter content was generated.")
+
+        merged_glossary = merge_glossary(chapter_results)
+        merged_notes = merge_notes(chapter_results)
+
+        return {
+            "title": clean_text(f"{document.get('name', 'Document')} · Graded Reader")[:140],
+            "summary_en": clean_text(chapter_results[0].get("summary_en", ""))[:1200],
+            "level": level,
+            "documentId": doc_id,
+            "documentName": document.get("name", "document"),
+            "sections": chapter_results,
+            "glossary": merged_glossary,
+            "notes": merged_notes,
+            "truncated": truncated,
+        }
+
+
+async def request_deepseek_json(prompt_payload: dict[str, Any], max_tokens: int = 1800) -> dict[str, Any]:
+    timeout = httpx.Timeout(75.0, connect=10.0, read=75.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            },
+            json={
+                "model": MODEL,
+                "temperature": 0.3,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You write graded readers for Mandarin learners and return strict JSON.",
+                    },
+                    {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
+                ],
+            },
+        )
+
+    if response.status_code >= 400:
+        msg = "DeepSeek request failed."
+        try:
+            err = response.json()
+            msg = err.get("error", {}).get("message", msg)
+        except Exception:
+            pass
+        raise HTTPException(status_code=response.status_code, detail=msg)
+
+    payload = response.json()
+    content = payload.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+    try:
+        return json.loads(content)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid JSON from model: {exc}")
+
+
+def split_document_sections(text: str, max_chars: int = 14000, min_chars: int = 3600) -> list[dict[str, str]]:
+    source = str(text or "").strip()
+    if not source:
+        return []
+
+    lines = [line.strip() for line in source.split("\n")]
+    heading_rx = re.compile(r"^(第[一二三四五六七八九十百千万0-9]+[章节回]|chapter\s+\d+|ch\.?\s*\d+)\b", re.I)
+
+    sections: list[dict[str, str]] = []
+    current_title = ""
+    current_parts: list[str] = []
+
+    def flush_section() -> None:
+        nonlocal current_title, current_parts
+        body = "\n".join(current_parts).strip()
+        if body:
+            sections.append({"title": current_title or f"Section {len(sections) + 1}", "text": body})
+        current_title = ""
+        current_parts = []
+
+    for line in lines:
+        if not line:
+            if current_parts and current_parts[-1] != "":
+                current_parts.append("")
+            continue
+
+        if heading_rx.search(line) and len("\n".join(current_parts)) >= min_chars:
+            flush_section()
+            current_title = line[:120]
+            continue
+
+        current_parts.append(line)
+        if len("\n".join(current_parts)) >= max_chars:
+            flush_section()
+
+    flush_section()
+
+    if not sections:
+        return []
+
+    merged: list[dict[str, str]] = []
+    for section in sections:
+        text_len = len(section.get("text", ""))
+        if merged and text_len < min_chars // 2:
+            merged[-1]["text"] = f"{merged[-1]['text']}\n\n{section['text']}"
+            continue
+        merged.append(section)
+    return merged
+
+
+def merge_glossary(sections: list[dict[str, Any]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen = set()
+    for section in sections:
+        for item in section.get("glossary", []):
+            term = clean_text(item.get("term", ""))
+            explain = clean_text(item.get("explain_en", ""))
+            if not term or term in seen:
+                continue
+            seen.add(term)
+            out.append({"term": term, "explain_en": explain})
+            if len(out) >= 80:
+                return out
+    return out
+
+
+def merge_notes(sections: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for section in sections:
+        for note in section.get("notes", []):
+            value = clean_text(note)
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+            if len(out) >= 60:
+                return out
+    return out
+
+
+def is_content_exists_risk_error(detail: Any) -> bool:
+    text = str(detail or "").lower()
+    return "content exists risk" in text or ("content" in text and "risk" in text)
+
+
+def build_fallback_section_payload(section_title: str, section_text: str, level: str) -> dict[str, Any]:
+    candidates = split_into_sentences(section_text)
+    graded_lines = [line for line in candidates if contains_chinese(line)][:36]
+    if not graded_lines:
+        graded_lines = ["我们继续读这一章。", "先看主要内容，再看细节。"]
+
+    level_hint = f"for {level} learners" if level else "for learners"
+    return {
+        "chapter_title": clean_text(section_title)[:120] or "本章",
+        "chapter_summary_en": f"Fallback chapter compiled from source excerpts {level_hint} when model output was blocked.",
+        "graded_lines": graded_lines,
+        "glossary": [],
+        "notes": ["This chapter was generated using fallback extraction because model content risk was triggered."],
+    }
+
+
+def split_into_sentences(text: str) -> list[str]:
+    cleaned = str(text or "").replace("\r", "\n")
+    chunks = re.split(r"[\n]+", cleaned)
+    out: list[str] = []
+    for chunk in chunks:
+        piece = chunk.strip()
+        if not piece:
+            continue
+        for sentence in re.split(r"(?<=[。！？!?])", piece):
+            s = clean_text(sentence)
+            if not s:
+                continue
+            if 4 <= len(s) <= 80:
+                out.append(s)
+            if len(out) >= 120:
+                return out
+    return out
+
+
+def contains_chinese(text: str) -> bool:
+    return re.search(r"[\u3400-\u9fff]", str(text or "")) is not None
+
+
 @app.post("/api/pdf/graded-reader-pdf")
 async def pdf_graded_reader_pdf(request: Request):
         body = await request.json()
@@ -323,11 +609,96 @@ async def pdf_graded_reader_pdf(request: Request):
         return StreamingResponse(BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)
 
 
+@app.post("/api/pdf/graded-reader-book-pdf")
+async def pdf_graded_reader_book_pdf(request: Request):
+        body = await request.json()
+        title = clean_text(body.get("title", "Book Graded Reader"))[:140]
+        level = normalize_level(body.get("level"))
+        summary = clean_text(body.get("summary_en", ""))[:3000]
+        sections = body.get("sections", []) if isinstance(body.get("sections", []), list) else []
+        glossary = [x for x in body.get("glossary", []) if isinstance(x, dict)][:120]
+        notes = [clean_text(x) for x in body.get("notes", []) if clean_text(x)][:120]
+
+        graded_lines: list[str] = []
+        graded_token_lines: list[dict[str, Any]] = []
+        for idx, section in enumerate(sections[:48]):
+            section_title = clean_text(section.get("title", f"Section {idx + 1}"))[:120]
+            heading = f"【{section_title}】"
+            graded_lines.append(heading)
+            graded_token_lines.append({"tokens": tokenize_chinese_line(heading)})
+
+            for line in section.get("graded_lines", [])[:48]:
+                clean_line = clean_text(line)
+                if not clean_line:
+                    continue
+                graded_lines.append(clean_line)
+
+            for token_line in section.get("graded_token_lines", [])[:48]:
+                if isinstance(token_line, dict) and isinstance(token_line.get("tokens"), list):
+                    graded_token_lines.append({"tokens": token_line.get("tokens", [])})
+
+        if not graded_lines:
+            raise HTTPException(status_code=400, detail="No graded book content provided.")
+
+        pdf_bytes = build_graded_reader_pdf(
+            title=title,
+            level=level,
+            summary=summary,
+            graded_lines=graded_lines[:2400],
+            graded_token_lines=graded_token_lines[:2400],
+            notes=notes,
+            glossary=glossary,
+        )
+
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", title).strip("-") or "graded-reader-book"
+        headers = {"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'}
+        return StreamingResponse(BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)
+
+
+@app.post("/api/pdf/hanzi-pinyin")
+async def pdf_hanzi_pinyin(file: UploadFile = File(...)):
+        name = clean_text(file.filename or "document.pdf")
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        if not (name.lower().endswith(".pdf") or (file.content_type or "").lower() == "application/pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+        try:
+            reader = PdfReader(BytesIO(content))
+            pages = [page.extract_text() or "" for page in reader.pages]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not read PDF: {exc}")
+
+        pdf_bytes = build_hanzi_pinyin_pdf(pages)
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-") or "hanzi-pinyin"
+        headers = {"Content-Disposition": f'attachment; filename="{safe_name}-pinyin.pdf"'}
+        return StreamingResponse(BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)
+
+
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 
 def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:5000]
+
+
+def clean_document_text(value: Any) -> str:
+    raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    raw = raw.replace("\x00", " ")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in raw.split("\n")]
+    compact_lines: list[str] = []
+    blank_count = 0
+    for line in lines:
+        if not line:
+            blank_count += 1
+            if blank_count <= 1:
+                compact_lines.append("")
+            continue
+        blank_count = 0
+        compact_lines.append(line)
+    return "\n".join(compact_lines).strip()[:450000]
 
 
 def normalize_level(level_value: Any) -> str:
@@ -342,7 +713,7 @@ def normalize_history(history: Any) -> list[dict[str, str]]:
         return []
 
     out: list[dict[str, str]] = []
-    for item in history[-24:]:
+    for item in history[-60:]:
         if not isinstance(item, dict):
             continue
         role = item.get("role")
@@ -356,21 +727,40 @@ def normalize_history(history: Any) -> list[dict[str, str]]:
 def normalize_memory(memory: Any) -> list[str]:
     if not isinstance(memory, list):
         return []
-    return [clean_text(x) for x in memory if clean_text(x)][-16:]
+    return [clean_text(x) for x in memory if clean_text(x)][-28:]
 
 
 def normalize_web_options(web: Any) -> dict[str, Any]:
     web = web if isinstance(web, dict) else {}
-    enabled = web.get("enabled", True) is not False
+    enabled = bool(web.get("enabled", False))
     follow_depth = int(web.get("followDepth", 1) or 0)
-    follow_depth = max(0, min(2, follow_depth))
+    follow_depth = max(0, min(3, follow_depth))
+    seed_urls = normalize_seed_urls(web.get("seedUrls"))
     return {
         "enabled": enabled,
         "followDepth": follow_depth,
+        "seedUrls": seed_urls,
+        "useSearch": bool(web.get("useSearch", True)),
         "maxResultsPerQuery": 5,
-        "maxPages": 6,
-        "maxLinksPerPage": 3,
+        "maxPages": 8,
+        "maxLinksPerPage": 4,
     }
+
+
+def normalize_seed_urls(seed_urls: Any) -> list[str]:
+    if not isinstance(seed_urls, list):
+        return []
+    out: list[str] = []
+    seen = set()
+    for item in seed_urls[:8]:
+        url = str(item or "").strip()
+        if not re.match(r"^https?://", url, re.I):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out[:6]
 
 
 def build_deepseek_messages(
@@ -427,6 +817,7 @@ def build_deepseek_messages(
                     "Avoid dense biography dumps and avoid many dates or slogans.",
                     "Reply only with 3-8 lines of Chinese text.",
                     "No markdown, no JSON, no bullet list, no translation, no pinyin in output.",
+                    "Treat recent multi-turn context as authoritative and stay consistent with prior turns.",
                     "If web facts are used, include source markers like [1] in the line.",
                     level_line,
                     memory_line,
@@ -463,7 +854,8 @@ def build_deepseek_messages(
     return messages
 
 
-def rewrite_queries(topic: str, user_message: str) -> list[str]:
+def rewrite_queries(topic: str, user_message: str, seed_urls: list[str] | None = None) -> list[str]:
+    user_message = re.sub(r"https?://\S+", " ", str(user_message or ""))
     seed = clean_text(f"{topic} {user_message}")
     compact = re.sub(r"\s+", " ", re.sub(r"[?!.]", " ", seed)).strip()
     queries = [
@@ -471,6 +863,10 @@ def rewrite_queries(topic: str, user_message: str) -> list[str]:
         f"{compact} background overview",
         f"{compact} reliable sources timeline",
     ]
+    if seed_urls:
+        first_host = urlparse(seed_urls[0]).netloc
+        if first_host and compact:
+            queries.append(f"site:{first_host} {compact}")
     deduped: list[str] = []
     seen = set()
     for query in queries:
@@ -489,13 +885,34 @@ async def build_web_research(
     web: dict[str, Any],
 ) -> dict[str, Any] | None:
     last_turns = " ".join(item["content"] for item in history[-4:])
-    queries = rewrite_queries(topic, f"{user_message} {last_turns}")
-    search_results = await search_queries(queries, web["maxResultsPerQuery"])
-    if not search_results:
+    seed_results = [
+        {
+            "title": "User-provided link",
+            "url": url,
+            "snippet": "Link shared by user in chat",
+        }
+        for url in web.get("seedUrls", [])
+    ]
+
+    queries = rewrite_queries(topic, f"{user_message} {last_turns}", web.get("seedUrls", []))
+    search_results: list[dict[str, str]] = []
+    if web.get("useSearch", True):
+        search_results = await search_queries(queries, web["maxResultsPerQuery"])
+
+    deduped_results: list[dict[str, str]] = []
+    seen_urls = set()
+    for item in seed_results + search_results:
+        url = item.get("url", "")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        deduped_results.append(item)
+
+    if not deduped_results:
         return None
 
     pages = await crawl_pages(
-        search_results,
+        deduped_results,
         follow_depth=web["followDepth"],
         max_pages=web["maxPages"],
         max_links_per_page=web["maxLinksPerPage"],
@@ -751,17 +1168,25 @@ def build_graded_reader_pdf(
         pdf = canvas.Canvas(buffer, pagesize=A4)
         width, height = A4
         margin_x = 42
+        min_y = 58
         y = height - 48
+
+        def new_page():
+            nonlocal y
+            pdf.showPage()
+            y = height - 48
+
+        def ensure_room(required: int):
+            if y - required < min_y:
+                new_page()
 
         def write_line(text: str, size: int = 11, leading: int = 16, indent: int = 0, font: str = "STSong-Light"):
             nonlocal y
             pdf.setFont(font, size)
             wrapped = wrap_text(text, max_chars=max(14, int((width - margin_x * 2 - indent) / (size * 0.9))))
             for line in wrapped:
-                if y < 58:
-                    pdf.showPage()
-                    y = height - 48
-                    pdf.setFont(font, size)
+                ensure_room(leading)
+                pdf.setFont(font, size)
                 pdf.drawString(margin_x + indent, y, line)
                 y -= leading
 
@@ -773,23 +1198,23 @@ def build_graded_reader_pdf(
             max_x = width - margin_x
             x = margin_x
             line_step = hanzi_size + pinyin_size + 11
+            ensure_room(line_step)
 
             def new_row():
                 nonlocal x, y
                 y -= line_step
-                if y < 58:
-                    pdf.showPage()
-                    y = height - 48
+                if y < min_y:
+                    new_page()
                 x = margin_x
 
             for token in tokens:
                 hanzi = clean_text(token.get("hanzi", ""))
-                py = clean_text(token.get("pinyin", ""))
+                py = pdf_safe_pinyin(clean_text(token.get("pinyin", "")))
                 if not hanzi:
                     continue
 
                 hanzi_w = pdf.stringWidth(hanzi, "STSong-Light", hanzi_size)
-                py_w = pdf.stringWidth(py, "Helvetica", pinyin_size) if py else 0
+                py_w = pdf.stringWidth(py, PINYIN_FONT, pinyin_size) if py else 0
                 cell_w = max(hanzi_w, py_w, 10) + 8
 
                 if x + cell_w > max_x:
@@ -797,7 +1222,7 @@ def build_graded_reader_pdf(
 
                 cx = x + (cell_w / 2)
                 if py:
-                    pdf.setFont("Helvetica", pinyin_size)
+                    pdf.setFont(PINYIN_FONT, pinyin_size)
                     pdf.drawCentredString(cx, y, py)
 
                 pdf.setFont("STSong-Light", hanzi_size)
@@ -816,7 +1241,7 @@ def build_graded_reader_pdf(
 
         token_lines = []
         if isinstance(graded_token_lines, list):
-            for item in graded_token_lines[:120]:
+            for item in graded_token_lines[:2400]:
                 if isinstance(item, dict):
                     raw_tokens = item.get("tokens", [])
                 else:
@@ -898,6 +1323,13 @@ def tone_mark_for_char(char: str) -> str:
     return result[0][0]
 
 
+def pdf_safe_pinyin(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    return unicodedata.normalize("NFC", value)
+
+
 def tokenize_chinese_line(line: str) -> list[dict[str, str]]:
     source = str(line or "").strip()
     if not source:
@@ -932,6 +1364,100 @@ def tokenize_chinese_line(line: str) -> list[dict[str, str]]:
 
     flush_latin()
     return tokens[:80]
+
+
+def tokenize_original_line_for_pinyin(line: str) -> list[dict[str, str]]:
+    tokens: list[dict[str, str]] = []
+    for char in str(line or ""):
+        if char == "\r":
+            continue
+        tokens.append(
+            {
+                "hanzi": char,
+                "pinyin": tone_mark_for_char(char) if is_chinese_char(char) else "",
+            }
+        )
+    return tokens
+
+
+def build_hanzi_pinyin_pdf(pages: list[str]) -> bytes:
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    margin_x = 42
+    y = height - 48
+
+    hanzi_size = 13
+    pinyin_size = 8
+    line_step = hanzi_size + pinyin_size + 10
+    pinyin_y_offset = 0
+    hanzi_y_offset = -(pinyin_size + 6)
+    max_x = width - margin_x
+
+    def new_page():
+        nonlocal y
+        pdf.showPage()
+        y = height - 48
+
+    def ensure_room(min_height: int = 58):
+        nonlocal y
+        if y < min_height:
+            new_page()
+
+    def draw_interlinear_line(tokens: list[dict[str, str]]):
+        nonlocal y
+        if not tokens:
+            y -= line_step // 2
+            ensure_room()
+            return
+
+        x = margin_x
+        for token in tokens:
+            hanzi = token.get("hanzi", "")
+            py = pdf_safe_pinyin(token.get("pinyin", ""))
+            if not hanzi:
+                continue
+
+            hanzi_w = pdf.stringWidth(hanzi, "STSong-Light", hanzi_size)
+            py_w = pdf.stringWidth(py, PINYIN_FONT, pinyin_size) if py else 0
+            cell_w = max(hanzi_w, py_w, 5) + 3
+
+            if x + cell_w > max_x and hanzi.strip():
+                y -= line_step
+                ensure_room()
+                x = margin_x
+
+            cx = x + (cell_w / 2)
+            if py:
+                pdf.setFont(PINYIN_FONT, pinyin_size)
+                pdf.drawCentredString(cx, y + pinyin_y_offset, py)
+
+            if hanzi.strip():
+                pdf.setFont("STSong-Light", hanzi_size)
+                pdf.drawCentredString(cx, y + hanzi_y_offset, hanzi)
+
+            x += cell_w
+
+        y -= line_step
+        ensure_room()
+
+    for page_index, page_text in enumerate(pages):
+        raw_lines = str(page_text or "").splitlines()
+        if not raw_lines:
+            raw_lines = [""]
+
+        for raw_line in raw_lines:
+            if not raw_line.strip():
+                y -= line_step // 2
+                ensure_room()
+                continue
+            draw_interlinear_line(tokenize_original_line_for_pinyin(raw_line))
+
+        if page_index < len(pages) - 1:
+            new_page()
+
+    pdf.save()
+    return buffer.getvalue()
 
 
 def normalize_reply_from_text(text: str, topic: str, level: str) -> dict[str, Any]:
