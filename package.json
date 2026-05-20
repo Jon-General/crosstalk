@@ -4,12 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "sh -c 'uvicorn main:app --host 0.0.0.0 --port ${PORT:-3000}'",
+    "dev": "sh -c 'uvicorn main:app --host 0.0.0.0 --port ${PORT:-3000} --reload'"
   },
   "dependencies": {
+    "cheerio": "^1.2.0",
     "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "pinyin-pro": "^3.28.1"
   },
   "engines": {
     "node": ">=18"
