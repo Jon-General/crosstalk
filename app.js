@@ -127,6 +127,7 @@ function App() {
   });
   const [busy, setBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [documentMeta, setDocumentMeta] = useState(null);
   const [gradedPack, setGradedPack] = useState(null);
 
@@ -223,6 +224,7 @@ function App() {
   function switchMode(nextMode) {
     if (nextMode === mode) return;
     setMode(nextMode);
+    setMenuOpen(false);
     addNotice(nextMode === "casual" ? "Mode: Casual conversation" : "Mode: PDF to graded reader");
   }
 
@@ -495,45 +497,71 @@ function App() {
   return html`
     <div className="app-shell">
       <main className="chat-shell" aria-label="Tutor chat">
-        <div className="mode-row">
-          <button
-            type="button"
-            className=${`mode-btn ${mode === "casual" ? "active" : ""}`}
-            onClick=${() => switchMode("casual")}
-            disabled=${busy || pdfBusy}
-          >
-            Casual Conversation
-          </button>
-          <button
-            type="button"
-            className=${`mode-btn ${mode === "graded" ? "active" : ""}`}
-            onClick=${() => switchMode("graded")}
-            disabled=${busy || pdfBusy}
-          >
-            PDF -> Graded Reader
-          </button>
+        <div>
+          <div className="chat-header">
+            <span className="chat-header-title">
+              crosstalk
+              <span className="chat-header-mode">${mode === "graded" ? "· PDF Reader" : "· Casual"}</span>
+            </span>
+            <button
+              type="button"
+              className=${`menu-toggle ${menuOpen ? "open" : ""}`}
+              onClick=${() => setMenuOpen((o) => !o)}
+              aria-label=${menuOpen ? "Close menu" : "Open menu"}
+              aria-expanded=${menuOpen}
+            >
+              ${menuOpen ? "✕" : "☰"}
+            </button>
+          </div>
 
-          <button type="button" className="mode-btn subtle" disabled=${busy || pdfBusy} onClick=${clearChat}>New Chat</button>
-        </div>
+          ${menuOpen
+            ? html`<div className="menu-panel">
+                <div className="menu-modes">
+                  <button
+                    type="button"
+                    className=${`mode-btn ${mode === "casual" ? "active" : ""}`}
+                    onClick=${() => switchMode("casual")}
+                    disabled=${busy || pdfBusy}
+                  >
+                    Casual Conversation
+                  </button>
+                  <button
+                    type="button"
+                    className=${`mode-btn ${mode === "graded" ? "active" : ""}`}
+                    onClick=${() => switchMode("graded")}
+                    disabled=${busy || pdfBusy}
+                  >
+                    PDF → Graded Reader
+                  </button>
+                  <button
+                    type="button"
+                    className="mode-btn subtle"
+                    disabled=${busy || pdfBusy}
+                    onClick=${() => { clearChat(); setMenuOpen(false); }}
+                  >
+                    New Chat
+                  </button>
+                </div>
 
-        <div className="tool-row">
-          ${mode === "graded"
-            ? html`
-                <input
-                  ref=${uploadRef}
-                  className="hidden-upload"
-                  type="file"
-                  accept="application/pdf,text/plain,.pdf,.txt,.md"
-                  onChange=${handleUploadPdf}
-                />
-                <button type="button" disabled=${busy || pdfBusy} onClick=${() => uploadRef.current?.click()}>Upload PDF</button>
-                <button type="button" disabled=${busy || pdfBusy || !documentMeta?.id} onClick=${makeGradedReader}>Abridge + Grade</button>
-                <button type="button" disabled=${busy || pdfBusy || !gradedPack} onClick=${downloadGradedPdf}>Download PDF</button>
-                ${documentMeta
-                  ? html`<span className="doc-chip">${documentMeta.name}</span>`
-                  : html`<span className="doc-chip muted">No document loaded</span>`}
-              `
-            : html`<span className="doc-chip muted">Casual chat mode: just type and chat.</span>`}
+                ${mode === "graded"
+                  ? html`<div className="menu-tools">
+                      <input
+                        ref=${uploadRef}
+                        className="hidden-upload"
+                        type="file"
+                        accept="application/pdf,text/plain,.pdf,.txt,.md"
+                        onChange=${handleUploadPdf}
+                      />
+                      <button type="button" disabled=${busy || pdfBusy} onClick=${() => uploadRef.current?.click()}>Upload PDF</button>
+                      <button type="button" disabled=${busy || pdfBusy || !documentMeta?.id} onClick=${makeGradedReader}>Abridge + Grade</button>
+                      <button type="button" disabled=${busy || pdfBusy || !gradedPack} onClick=${downloadGradedPdf}>Download PDF</button>
+                      ${documentMeta
+                        ? html`<span className="doc-chip">${documentMeta.name}</span>`
+                        : html`<span className="doc-chip muted">No document loaded</span>`}
+                    </div>`
+                  : null}
+              </div>`
+            : null}
         </div>
 
         <section className="chat-log" id="chatLog" aria-live="polite" ref=${chatLogRef}>
