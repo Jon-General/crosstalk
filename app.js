@@ -60,7 +60,7 @@ function TokenLine({ tokens }) {
   </div>`;
 }
 
-function MessageBubble({ msg }) {
+function MessageBubble({ msg, showPinyin, onSpeak, speakingId }) {
   if (msg.type === "notice") {
     return html`<article className="message notice">${msg.text}</article>`;
   }
@@ -73,8 +73,26 @@ function MessageBubble({ msg }) {
     return html`<article className="message tutor pending"><p className="pending-text">${msg.text || "Thinking..."}</p></article>`;
   }
 
+  const isSpeaking = speakingId === msg.id;
+  const plainText = msg.lines?.map((line) => line.tokens.map((t) => t.hanzi).join("")).join("") || "";
+
   return html`<article className="message tutor">
-    ${msg.lines.map((line, idx) => html`<${TokenLine} key=${idx} tokens=${line.tokens} />`)}
+    <div className="tutor-lines" style=${{ opacity: showPinyin ? 1 : undefined }}>
+      ${msg.lines.map((line, idx) => {
+        const lineTokens = showPinyin ? line.tokens : line.tokens.map((t) => ({ ...t, pinyin: "" }));
+        return html`<${TokenLine} key=${idx} tokens=${lineTokens} />`;
+      })}
+    </div>
+    <button
+      type="button"
+      className=${`tts-btn ${isSpeaking ? "speaking" : ""}`}
+      title=${isSpeaking ? "Speaking..." : "Read aloud"}
+      disabled=${isSpeaking}
+      onClick=${() => onSpeak && onSpeak(msg.id, plainText)}
+      aria-label="Read aloud"
+    >
+      🔊
+    </button>
     ${msg.citations?.length
       ? html`<div className="citations">
           <p>Sources</p>
@@ -101,6 +119,17 @@ function extractSeedUrls(text) {
     }
   }
   return urls.slice(0, 4);
+}
+
+function speakText(text) {
+  if (!("speechSynthesis" in window)) return;
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = "zh-CN";
+  utterance.rate = 0.85;
+  utterance.onend = () => {};
+  utterance.onerror = () => {};
+  window.speechSynthesis.speak(utterance);
 }
 
 function App() {
@@ -137,6 +166,13 @@ function App() {
   const [bookPdfName, setBookPdfName] = useState("");
   const [pinyinPdfLink, setPinyinPdfLink] = useState("");
   const [pinyinPdfName, setPinyinPdfName] = useState("");
+  const [showPinyin, setShowPinyin] = useState(true);
+  const [ttsSpeaking, setTtsSpeaking] = useState(null); // message id currently speaking
+  const [vocabData, setVocabData] = useState({ words: [], total: 0 });
+  const [vocabSort, setVocabSort] = useState("recent");
+  const [quizItems, setQuizItems] = useState([]);
+  const [quizReveal, setQuizReveal] = useState({});
+  const [quizScore, setQuizScore] = useState(null);
 
   const chatLogRef = useRef(null);
   const inputRef = useRef(null);
@@ -168,6 +204,89 @@ function App() {
 
   function trackBlobUrl(url) {
     createdFileUrlsRef.current.push(url);
+  }
+
+  function handleSpeak(msgId, text) {
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+      setTtsSpeaking(msgId);
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "zh-CN";
+      utterance.rate = 0.85;
+      utterance.onend = () => setTtsSpeaking(null);
+      utterance.onerror = () => setTtsSpeaking(null);
+      window.speechSynthesis.speak(utterance);
+    }
+  }
+
+  async function fetchVocab(sort) {
+    try {
+      const res = await fetch(`/api/vocab?sort=${sort || vocabSort || "recent"}&limit=100`);
+      if (res.ok) {
+        const data = await res.json();
+        setVocabData(data);
+      }
+    } catch {}
+  }
+
+  async function fetchQuiz() {
+    try {
+      const res = await fetch("/api/vocab/quiz?count=8");
+      const data = await res.json();
+      setQuizItems(data.quiz || []);
+      setQuizReveal({});
+      setQuizScore(null);
+    } catch {}
+  }
+
+  async function trackVocabFromText(text) {
+    const src = String(text || "").trim();
+    if (!src) return;
+    const seen = new Set();
+    const words = [];
+    for (const ch of src) {
+      if (/[\u4e00-\u9fff]/.test(ch) && !seen.has(ch)) {
+        seen.add(ch);
+        words.push({ hanzi: ch, pinyin: "", context: src.slice(0, 200) });
+      }
+    }
+    if (words.length === 0) return;
+    try {
+      await fetch("/api/vocab/track", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ words: words.slice(0, 80) }),
+      });
+    } catch {}
+  }
+
+  async function deleteVocabWord(id) {
+    try {
+      await fetch(`/api/vocab/${id}`, { method: "DELETE" });
+      fetchVocab();
+    } catch {}
+  }
+
+  async function clearVocab() {
+    if (!confirm("Delete all vocabulary?")) return;
+    try {
+      await fetch("/api/vocab", { method: "DELETE" });
+      setVocabData({ words: [], total: 0 });
+    } catch {}
+  }
+
+  function checkQuizAnswer(idx, answer) {
+    const item = quizItems[idx];
+    if (!item) return;
+    const userAnswer = String(answer || "").toLowerCase().replace(/\s+/g, "");
+    const correct = String(item.pinyin || "").toLowerCase().replace(/\s+/g, "");
+    setQuizReveal((prev) => ({ ...prev, [idx]: { userAnswer, correct, isCorrect: userAnswer === correct } }));
+  }
+
+  function calcQuizScore() {
+    const revealed = Object.values(quizReveal);
+    const correct = revealed.filter((r) => r.isCorrect).length;
+    setQuizScore({ correct, total: quizItems.length });
   }
 
   function parseDownloadName(response, fallback) {
@@ -256,20 +375,32 @@ function App() {
     const name = src.match(/\bmy name is\s+([a-z][a-z\s'-]{1,40})/i);
     if (name?.[1]) facts.push(`User name: ${name[1].trim()}`);
 
-    const goal = src.match(/\b(my goal is|i want to|i need to)\s+(.+)$/i);
+    const goal = src.match(/\b(my goal is|i want to|i need to|i hope to)\s+(.+)$/i);
     if (goal?.[2]) facts.push(`User goal: ${goal[2].trim()}`);
 
-    const preference = src.match(/\b(i like|i prefer|i enjoy|i dislike|i hate)\s+(.+)$/i);
+    const preference = src.match(/\b(i like|i prefer|i enjoy|i dislike|i hate|i love)\s+(.+)$/i);
     if (preference?.[2]) facts.push(`User preference: ${preference[2].trim()}`);
+
+    const location = src.match(/\b(i live in|i'm from|i am from|i'm going to|i am going to|i moved to|i stay in)\s+(.+?)(?:[\.!?]|$)/i);
+    if (location?.[2]) facts.push(`User location/travel: ${location[2].trim()}`);
+
+    const occupation = src.match(/\b(i work as|i'm a|i am a|my job is|i do)\s+(.+?)(?:[\.!?]|$)/i);
+    if (occupation?.[2] && occupation[2].length < 60) facts.push(`User occupation: ${occupation[2].trim()}`);
+
+    const studying = src.match(/\b(i'm studying|i am studying|i'm learning|i am learning|i study)\s+(.+?)(?:[\.!?]|$)/i);
+    if (studying?.[2]) facts.push(`User studies: ${studying[2].trim()}`);
+
+    const timeRef = src.match(/\b(next week|next month|tomorrow|this weekend|in \w+)\b/i);
+    if (timeRef?.[1]) facts.push(`User mentioned timeframe: ${timeRef[1]}`);
 
     const urls = extractSeedUrls(src);
     if (urls.length) facts.push(`User shared links: ${urls.join(" | ")}`);
 
-    if (src.length > 10 && src.length <= 140 && facts.length === 0) {
+    if (src.length > 10 && src.length <= 200 && facts.length === 0) {
       facts.push(`Recent user note: ${src}`);
     }
 
-    return facts.slice(0, 5);
+    return facts.slice(0, 6);
   }
 
   function deriveRecentIntentFacts(nextHistory) {
@@ -406,9 +537,13 @@ function App() {
       setMessages((prev) => prev.map((m) => (m.id === pendingId ? { id: pendingId, role: "assistant", lines, citations } : m)));
       setHistory((prev) => [...prev, { role: "assistant", content: toPlainText(lines) }]);
 
-      // Auto-summarize every 6 user turns
+      // Track vocabulary from tutor responses
+      const responseText = toPlainText(lines);
+      trackVocabFromText(responseText);
+
+      // Auto-summarize every 4 user turns
       summaryTurnRef.current += 1;
-      if (summaryTurnRef.current >= 6 && !summaryBusyRef.current) {
+      if (summaryTurnRef.current >= 4 && !summaryBusyRef.current) {
         summaryBusyRef.current = true;
         fetch("/api/summarize", {
           method: "POST",
@@ -590,20 +725,30 @@ function App() {
       <main className="chat-shell" aria-label="Tutor app">
         <div className="chat-header">
           <span className="chat-header-title">crosstalk</span>
+          <button
+            type="button"
+            className=${`pinyin-toggle ${showPinyin ? "on" : "off"}`}
+            onClick=${() => setShowPinyin((v) => !v)}
+            title=${showPinyin ? "Hide pinyin" : "Show pinyin"}
+          >
+            ${showPinyin ? "拼音 ON" : "拼音 OFF"}
+          </button>
           <div className="top-tabs" role="tablist" aria-label="App tabs">
             <button type="button" className=${`tab-btn ${tab === "chat" ? "active" : ""}`} onClick=${() => setTab("chat")}>Tutor Chat</button>
             <button type="button" className=${`tab-btn ${tab === "studio" ? "active" : ""}`} onClick=${() => setTab("studio")}>PDF Studio</button>
+            <button type="button" className=${`tab-btn ${tab === "vocab" ? "active" : ""}`} onClick=${() => { setTab("vocab"); fetchVocab(); }}>Vocab</button>
           </div>
         </div>
 
         ${tab === "chat"
           ? html`
               <section className="chat-log" id="chatLog" aria-live="polite" ref=${chatLogRef}>
-                ${messages.map((msg) => html`<${MessageBubble} key=${msg.id} msg=${msg} />`)}
+                ${messages.map((msg) => html`<${MessageBubble} key=${msg.id} msg=${msg} showPinyin=${showPinyin} onSpeak=${handleSpeak} speakingId=${ttsSpeaking} />`)}
               </section>
 
               <form className="chat-form" onSubmit=${sendMessage}>
-                <select
+                <div className="composer-row">
+                  <select
                   className="composer-level"
                   value=${level}
                   onChange=${(e) => {
@@ -627,7 +772,79 @@ function App() {
                   disabled=${busy}
                 />
                 <button className="send-arrow" type="submit" disabled=${busy} aria-label="Send">➤</button>
+                </div>
               </form>
+            `
+          : tab === "vocab"
+          ? html`
+              <section className="vocab-pane" aria-live="polite">
+                <div className="vocab-toolbar">
+                  <select value=${vocabSort} onChange=${(e) => { setVocabSort(e.target.value); fetchVocab(e.target.value); }}>
+                    <option value="recent">Most Recent</option>
+                    <option value="frequent">Most Seen</option>
+                    <option value="oldest">First Seen</option>
+                  </select>
+                  <button type="button" onClick=${() => fetchVocab()}>Refresh</button>
+                  <button type="button" onClick=${fetchQuiz}>Quiz Me</button>
+                  <button type="button" className="danger-btn" onClick=${clearVocab}>Clear All</button>
+                </div>
+
+                ${quizItems.length > 0
+                  ? html`
+                      <div className="quiz-panel">
+                        <h3>Vocab Quiz</h3>
+                        ${quizItems.map(
+                          (item, idx) => html`
+                            <div key=${idx} className="quiz-item">
+                              <span className="quiz-hanzi">${item.hanzi}</span>
+                              ${quizReveal[idx]
+                                ? html`
+                                    <span className=${`quiz-answer ${quizReveal[idx].isCorrect ? "correct" : "wrong"}`}>
+                                      ${quizReveal[idx].correct} ${quizReveal[idx].isCorrect ? "✓" : `✗ (you: ${quizReveal[idx].userAnswer})`}
+                                    </span>
+                                  `
+                                : html`
+                                    <input
+                                      type="text"
+                                      placeholder="Type pinyin"
+                                      onKeyDown=${(e) => {
+                                        if (e.key === "Enter") checkQuizAnswer(idx, e.target.value);
+                                      }}
+                                      onBlur=${(e) => checkQuizAnswer(idx, e.target.value)}
+                                    />
+                                  `}
+                            </div>
+                          `
+                        )}
+                        <div className="quiz-actions">
+                          ${quizScore
+                            ? html`<p className="quiz-score">Score: ${quizScore.correct}/${quizScore.total}</p>`
+                            : null}
+                          <button type="button" onClick=${calcQuizScore}>Check All</button>
+                          <button type="button" onClick=${fetchQuiz}>New Quiz</button>
+                        </div>
+                      </div>
+                    `
+                  : null}
+
+                <p className="vocab-count">${vocabData.total} words tracked</p>
+                ${vocabData.words.length === 0
+                  ? html`<p className="vocab-empty">No vocabulary yet. Start chatting and words will appear here.</p>`
+                  : html`
+                      <ul className="vocab-list">
+                        ${vocabData.words.map(
+                          (word) => html`
+                            <li key=${word.id} className="vocab-item">
+                              <span className="vocab-hanzi">${word.hanzi}</span>
+                              <span className="vocab-pinyin">${word.pinyin || "—"}</span>
+                              <span className="vocab-count">×${word.times_seen}</span>
+                              <button type="button" className="vocab-delete" onClick=${() => deleteVocabWord(word.id)} title="Remove">×</button>
+                            </li>
+                          `
+                        )}
+                      </ul>
+                    `}
+              </section>
             `
           : html`
               <section className="studio-pane" aria-live="polite">

@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import sqlite3
 import unicodedata
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
@@ -26,9 +28,81 @@ app = FastAPI()
 
 PORT = int(os.getenv("PORT", "3000"))
 MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+CHEAP_MODEL = os.getenv("DEEPSEEK_CHEAP_MODEL", "deepseek-v4-flash")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 WEB_USER_AGENT = "Mozilla/5.0 (compatible; CrosstalkTutor/0.2; +https://example.invalid)"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crosstalk.db")
 DOCUMENT_STORE: dict[str, dict[str, Any]] = {}
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def _init_db() -> None:
+    conn = _get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            pages INTEGER DEFAULT 0,
+            chars INTEGER DEFAULT 0,
+            text TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS vocabulary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hanzi TEXT NOT NULL UNIQUE,
+            pinyin TEXT NOT NULL DEFAULT '',
+            times_seen INTEGER DEFAULT 1,
+            first_seen TEXT DEFAULT (datetime('now')),
+            last_seen TEXT DEFAULT (datetime('now')),
+            last_context TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_vocab_hanzi ON vocabulary(hanzi);
+        CREATE INDEX IF NOT EXISTS idx_vocab_last_seen ON vocabulary(last_seen DESC);
+    """)
+    conn.commit()
+    conn.close()
+    # Migrate any in-memory docs to DB on startup
+    _migrate_memory_docs()
+
+def _migrate_memory_docs() -> None:
+    if not DOCUMENT_STORE:
+        return
+    conn = _get_db()
+    for doc_id, doc in DOCUMENT_STORE.items():
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO documents (id, name, pages, chars, text) VALUES (?, ?, ?, ?, ?)",
+                (doc_id, doc["name"], doc.get("pages", 0), doc.get("chars", 0), doc.get("text", ""))
+            )
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    DOCUMENT_STORE.clear()
+
+def _save_document(doc_id: str, name: str, pages: int, chars: int, text: str) -> None:
+    conn = _get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO documents (id, name, pages, chars, text) VALUES (?, ?, ?, ?, ?)",
+        (doc_id, name, pages, chars, text)
+    )
+    conn.commit()
+    conn.close()
+
+def _load_document(doc_id: str) -> dict[str, Any] | None:
+    conn = _get_db()
+    row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {"id": row["id"], "name": row["name"], "pages": row["pages"], "chars": row["chars"], "text": row["text"]}
+
+_init_db()
 
 registerFont(UnicodeCIDFont("STSong-Light"))
 
@@ -193,13 +267,7 @@ async def pdf_extract(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="No extractable text found in file.")
 
         doc_id = os.urandom(8).hex()
-        DOCUMENT_STORE[doc_id] = {
-            "id": doc_id,
-            "name": name,
-            "pages": pages,
-            "chars": len(cleaned),
-            "text": cleaned[:450000],
-        }
+        _save_document(doc_id, name, pages, len(cleaned), cleaned[:450000])
 
         return {
             "id": doc_id,
@@ -217,7 +285,7 @@ async def pdf_graded_reader(request: Request):
         level = normalize_level(body.get("level"))
         objective = clean_text(body.get("objective", ""))
 
-        document = DOCUMENT_STORE.get(doc_id)
+        document = _load_document(doc_id)
         if not document:
             raise HTTPException(status_code=404, detail="Document not found. Upload again.")
 
@@ -316,7 +384,7 @@ async def pdf_graded_reader_book(request: Request):
         level = normalize_level(body.get("level"))
         objective = clean_text(body.get("objective", ""))
 
-        document = DOCUMENT_STORE.get(doc_id)
+        document = _load_document(doc_id)
         if not document:
             raise HTTPException(status_code=404, detail="Document not found. Upload again.")
 
@@ -1152,7 +1220,7 @@ def pick_used_citations(text: str, citations: list[dict[str, Any]]) -> list[dict
 def build_document_context(document_id: str) -> str | None:
         if not document_id:
             return None
-        doc = DOCUMENT_STORE.get(document_id)
+        doc = _load_document(document_id)
         if not doc:
             return None
 
@@ -1525,7 +1593,7 @@ async def summarize_conversation(request: Request):
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                 },
                 json={
-                    "model": MODEL,
+                    "model": CHEAP_MODEL,
                     "temperature": 0.2,
                     "max_tokens": 200,
                     "messages": [
@@ -1554,6 +1622,106 @@ async def summarize_conversation(request: Request):
         return JSONResponse({"summary": summary[:400], "ok": True})
     except Exception:
         return JSONResponse({"summary": "", "ok": False})
+
+
+@app.post("/api/vocab/track")
+async def vocab_track(request: Request):
+    """Track vocabulary words seen in tutor responses."""
+    body = await request.json()
+    words = body.get("words", [])
+    if not isinstance(words, list) or not words:
+        return JSONResponse({"tracked": 0})
+    
+    conn = _get_db()
+    tracked = 0
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for word in words:
+        hanzi = clean_text(word.get("hanzi", ""))
+        pinyin_str = clean_text(word.get("pinyin", ""))
+        context = clean_text(word.get("context", ""))[:200]
+        if not hanzi or len(hanzi) > 20:
+            continue
+        try:
+            conn.execute(
+                """INSERT INTO vocabulary (hanzi, pinyin, times_seen, first_seen, last_seen, last_context)
+                   VALUES (?, ?, 1, ?, ?, ?)
+                   ON CONFLICT(hanzi) DO UPDATE SET
+                   pinyin = CASE WHEN vocabulary.pinyin = '' THEN excluded.pinyin ELSE vocabulary.pinyin END,
+                   times_seen = vocabulary.times_seen + 1,
+                   last_seen = excluded.last_seen,
+                   last_context = excluded.last_context""",
+                (hanzi, pinyin_str, now, now, context)
+            )
+            tracked += 1
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    return JSONResponse({"tracked": tracked})
+
+
+@app.get("/api/vocab")
+async def vocab_list(sort: str = "recent", limit: int = 50, offset: int = 0):
+    """Get vocabulary list."""
+    conn = _get_db()
+    order = "last_seen DESC" if sort == "recent" else "first_seen ASC" if sort == "oldest" else "times_seen DESC"
+    rows = conn.execute(
+        f"SELECT id, hanzi, pinyin, times_seen, first_seen, last_seen, last_context FROM vocabulary ORDER BY {order} LIMIT ? OFFSET ?",
+        (max(1, min(limit, 200)), max(0, offset))
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
+    conn.close()
+    return JSONResponse({
+        "words": [dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@app.delete("/api/vocab/{word_id}")
+async def vocab_delete(word_id: int):
+    """Delete a vocabulary entry."""
+    conn = _get_db()
+    conn.execute("DELETE FROM vocabulary WHERE id = ?", (word_id,))
+    deleted = conn.total_changes
+    conn.commit()
+    conn.close()
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Word not found.")
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/vocab")
+async def vocab_clear():
+    """Clear all vocabulary."""
+    conn = _get_db()
+    conn.execute("DELETE FROM vocabulary")
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "deleted": True})
+
+
+@app.get("/api/vocab/quiz")
+async def vocab_quiz(count: int = 5):
+    """Generate a simple vocab quiz from tracked words."""
+    conn = _get_db()
+    words = conn.execute(
+        "SELECT hanzi, pinyin FROM vocabulary ORDER BY RANDOM() LIMIT ?",
+        (max(1, min(count, 20)),)
+    ).fetchall()
+    conn.close()
+    if not words:
+        return JSONResponse({"quiz": [], "ok": False, "message": "No vocabulary tracked yet."})
+    
+    quiz_items = []
+    for w in words:
+        quiz_items.append({
+            "hanzi": w["hanzi"],
+            "pinyin": w["pinyin"],
+            "question": f"What is the pinyin for: {w['hanzi']}?",
+        })
+    return JSONResponse({"quiz": quiz_items, "ok": True, "count": len(quiz_items)})
 
 
 if __name__ == "__main__":
