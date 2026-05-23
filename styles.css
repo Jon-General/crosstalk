@@ -529,13 +529,16 @@ ruby.word rt {
 }
 
 .composer-level {
+  width: 105px;
+  min-width: 105px;
+  flex-shrink: 0;
   border-radius: 10px;
   padding: 9px 10px;
   background: #101a27;
-  min-width: 0;
 }
 
 .chat-form input {
+  flex: 1;
   min-width: 0;
 }
 
@@ -605,7 +608,10 @@ ruby.word rt {
   }
 
   .composer-level {
-    grid-column: 1 / span 2;
+    width: 90px;
+    min-width: 90px;
+    font-size: 0.78rem;
+    padding: 7px 8px;
   }
 
   .quick-replies {
@@ -691,8 +697,10 @@ ruby.word rt {
 /* ── Composer row ── */
 .composer-row {
   display: flex;
+  flex: 1;
   gap: 8px;
   align-items: center;
+  min-width: 0;
 }
 .composer-row input {
   flex: 1;
