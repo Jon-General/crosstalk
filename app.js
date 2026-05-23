@@ -117,7 +117,7 @@ function App() {
     try {
       const saved = JSON.parse(localStorage.getItem(MEMORY_KEY) || "[]");
       if (!Array.isArray(saved)) return [];
-      return saved.filter((fact) => !/^Current level:/i.test(String(fact))).slice(-28);
+      return saved.filter((fact) => !/^Current level:/i.test(String(fact))).slice(-32);
     } catch {
       return [];
     }
@@ -144,11 +144,13 @@ function App() {
   const pinyinUploadRef = useRef(null);
   const activeGradedFileRef = useRef(null);
 
+  const summaryTurnRef = useRef(0);
+  const summaryBusyRef = useRef(false);
   const createdFileUrlsRef = useRef([]);
   const hskLabel = useMemo(() => LEVELS.find((x) => x.value === level)?.label || "HSK 1", [level]);
 
   useEffect(() => {
-    localStorage.setItem(MEMORY_KEY, JSON.stringify(memory.slice(-28)));
+    localStorage.setItem(MEMORY_KEY, JSON.stringify(memory.slice(-32)));
   }, [memory]);
 
   useEffect(() => {
@@ -239,7 +241,7 @@ function App() {
     setMemory((prev) => {
       const next = prev.filter((fact) => !String(fact).startsWith(prefix));
       next.push(scoped);
-      return next.slice(-28);
+      return next.slice(-32);
     });
   }
 
@@ -273,10 +275,10 @@ function App() {
   function deriveRecentIntentFacts(nextHistory) {
     const recents = nextHistory
       .filter((item) => item.role === "user")
-      .slice(-6)
+      .slice(-12)
       .map((item) => String(item.content || "").trim())
       .filter(Boolean)
-      .slice(-3);
+      .slice(-6);
     return recents.map((line) => `Recent user intent: ${line.slice(0, 140)}`);
   }
 
@@ -314,14 +316,24 @@ function App() {
         extracted.forEach((fact) => {
           if (!next.includes(fact)) next.push(fact);
         });
-        return next.slice(-28);
+        return next.slice(-32);
       });
     }
 
     const levelFact = `Current level: ${hskLabel}`;
-    const stableMemory = memory.filter((fact) => !String(fact).startsWith("Current level:"));
+    const stableMemory = memory.filter(
+      (fact) =>
+        !String(fact).startsWith("Current level:") &&
+        !String(fact).startsWith("Recent user intent:")
+    );
     const recentIntentFacts = deriveRecentIntentFacts(nextHistory || []);
-    const memoryPayload = [...stableMemory, ...recentIntentFacts, levelFact, ...extracted].slice(-28);
+    
+    // Deduplicate: don't include intent facts that already exist in stable memory
+    const novelIntents = recentIntentFacts.filter(
+      (intent) => !stableMemory.some((fact) => String(fact).includes(intent.slice(20, 60)))
+    );
+    
+    const memoryPayload = [...stableMemory, ...novelIntents, levelFact, ...extracted].slice(-32);
 
     const webTrigger = /^\s*\/web\b|search:|\b(search web|web search|look up|find online|browse web|check online|open link|follow link|read this link|check this link)\b/i;
     const seedUrls = extractSeedUrls(userMessage);
@@ -393,6 +405,32 @@ function App() {
       const citations = Array.isArray(finalReply?.citations) ? finalReply.citations : [];
       setMessages((prev) => prev.map((m) => (m.id === pendingId ? { id: pendingId, role: "assistant", lines, citations } : m)));
       setHistory((prev) => [...prev, { role: "assistant", content: toPlainText(lines) }]);
+
+      // Auto-summarize every 6 user turns
+      summaryTurnRef.current += 1;
+      if (summaryTurnRef.current >= 6 && !summaryBusyRef.current) {
+        summaryBusyRef.current = true;
+        fetch("/api/summarize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ history: toHistoryPayload(nextHistory || []) }),
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            if (data.ok && data.summary) {
+              setMemory((prev) => {
+                const next = prev.filter((f) => !String(f).startsWith("Conversation summary:"));
+                next.push(data.summary);
+                return next.slice(-32);
+              });
+              summaryTurnRef.current = 0;
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            summaryBusyRef.current = false;
+          });
+      }
 
       if (finalReply?.web?.queries?.length) {
         addNotice(`Web queries used: ${finalReply.web.queries.join(" | ")}`);

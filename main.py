@@ -89,7 +89,7 @@ async def tutor_turn_stream(request: Request):
         payload = {
             "model": MODEL,
             "temperature": 0.35,
-            "max_tokens": 520,
+            "max_tokens": 1024,
             "stream": True,
             "messages": build_deepseek_messages(
                 history=history,
@@ -727,7 +727,7 @@ def normalize_history(history: Any) -> list[dict[str, str]]:
 def normalize_memory(memory: Any) -> list[str]:
     if not isinstance(memory, list):
         return []
-    return [clean_text(x) for x in memory if clean_text(x)][-28:]
+    return [clean_text(x) for x in memory if clean_text(x)][-32:]
 
 
 def normalize_web_options(web: Any) -> dict[str, Any]:
@@ -776,7 +776,7 @@ def build_deepseek_messages(
     mode_line = (
         "Start a fresh micro-lesson with gentle scaffolding and repetition."
         if make_lesson_mode
-        else "Continue naturally from context with short useful lines."
+        else "Continue the conversation naturally. Reference previous turns and memory facts to show you remember. Build on what was already discussed."
     )
 
     level_number = int(level.replace("HSK ", "") or "1")
@@ -787,9 +787,15 @@ def build_deepseek_messages(
     else:
         level_line = "Use natural intermediate vocabulary while staying clear and learner-friendly."
 
+    # Sort memory so persistent facts come first, recent-intent facts last
+    persistent = [m for m in memory if not m.startswith("Recent user intent:") and not m.startswith("Conversation summary:")]
+    recents = [m for m in memory if m.startswith("Recent user intent:")]
+    summaries = [m for m in memory if m.startswith("Conversation summary:")]
+    ordered = persistent + summaries + recents
     memory_line = (
-        f"Session memory to keep consistent: {' | '.join(memory)}"
-        if memory
+        f"CRITICAL — Remember these facts about the learner and conversation:\n"
+        + "\n".join(f"- {m}" for m in ordered)
+        if ordered
         else "Session memory to keep consistent: none"
     )
 
@@ -817,7 +823,9 @@ def build_deepseek_messages(
                     "Avoid dense biography dumps and avoid many dates or slogans.",
                     "Reply only with 3-8 lines of Chinese text.",
                     "No markdown, no JSON, no bullet list, no translation, no pinyin in output.",
-                    "Treat recent multi-turn context as authoritative and stay consistent with prior turns.",
+                    "You MUST read the full conversation history below. Reference prior turns explicitly when relevant — show the learner you remember what they said.",
+                    "If the learner asked about a topic 3-5 turns ago and now asks a related question, connect the two.",
+                    "Stay consistent: if they told you their name, city, or preferences earlier, use those facts.",
                     "If web facts are used, include source markers like [1] in the line.",
                     level_line,
                     memory_line,
@@ -1486,6 +1494,66 @@ def normalize_reply_from_text(text: str, topic: str, level: str) -> dict[str, An
         "topic": topic,
         "level": level,
     }
+
+
+@app.post("/api/summarize")
+async def summarize_conversation(request: Request):
+    """Summarize recent conversation turns into a compact memory fact."""
+    body = await request.json()
+    recent_history = normalize_history(body.get("history"))
+    
+    if not recent_history or not DEEPSEEK_API_KEY:
+        return JSONResponse({"summary": "", "ok": False})
+    
+    # Take last 12 turns for context
+    turns = recent_history[-12:]
+    if len(turns) < 4:
+        return JSONResponse({"summary": "", "ok": False})
+    
+    transcript = "\n".join(
+        f"{'Learner' if t['role'] == 'user' else 'Tutor'}: {t['content']}"
+        for t in turns
+    )
+    
+    try:
+        timeout = httpx.Timeout(20.0, connect=8.0, read=20.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                },
+                json={
+                    "model": MODEL,
+                    "temperature": 0.2,
+                    "max_tokens": 200,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Summarize this Mandarin tutoring conversation in 1-2 English sentences. "
+                                "Capture: the main topic, any facts the learner shared (name, location, goals, preferences), "
+                                "and what they're currently working on. Be specific, not generic. "
+                                "Format: 'Conversation summary: [your summary]'"
+                            ),
+                        },
+                        {"role": "user", "content": transcript},
+                    ],
+                },
+            )
+        
+        if response.status_code >= 400:
+            return JSONResponse({"summary": "", "ok": False})
+        
+        payload = response.json()
+        summary = payload.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if not summary.startswith("Conversation summary:"):
+            summary = f"Conversation summary: {summary}"
+        
+        return JSONResponse({"summary": summary[:400], "ok": True})
+    except Exception:
+        return JSONResponse({"summary": "", "ok": False})
 
 
 if __name__ == "__main__":
