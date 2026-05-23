@@ -523,11 +523,9 @@ ruby.word rt {
 .chat-form {
   border-top: 1px solid var(--line);
   padding: 10px 12px;
-  display: grid;
-  grid-template-columns: 110px 1fr auto;
+  display: flex;
   gap: 8px;
   align-items: center;
-  min-width: 0;
 }
 
 .composer-level {
@@ -593,7 +591,7 @@ ruby.word rt {
   }
 
   .chat-form {
-    grid-template-columns: 1fr auto;
+    padding: 8px 10px;
     gap: 6px;
   }
 
@@ -695,6 +693,10 @@ ruby.word rt {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+.composer-row input {
+  flex: 1;
+  min-width: 0;
 }
 
 /* ── Vocab pane ── */
