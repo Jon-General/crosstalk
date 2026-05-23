@@ -102,7 +102,14 @@ def _load_document(doc_id: str) -> dict[str, Any] | None:
         return None
     return {"id": row["id"], "name": row["name"], "pages": row["pages"], "chars": row["chars"], "text": row["text"]}
 
-_init_db()
+_db_initialized = False
+
+def _ensure_db() -> None:
+    global _db_initialized
+    if _db_initialized:
+        return
+    _init_db()
+    _db_initialized = True
 
 registerFont(UnicodeCIDFont("STSong-Light"))
 
@@ -120,6 +127,123 @@ for font_path in (
             continue
 
 
+@app.get("/api/ping")
+async def ping():
+    return {"pong": True}
+
+
+@app.get("/api/test-vocab")
+async def test_vocab():
+    try:
+        _ensure_db()
+        conn = _get_db()
+        count = conn.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
+        conn.close()
+        return {"count": count, "ok": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/vocab-list")
+async def vocab_list(sort: str = "recent", limit: int = 50, offset: int = 0):
+    _ensure_db()
+    conn = _get_db()
+    order = "last_seen DESC" if sort == "recent" else "first_seen ASC" if sort == "oldest" else "times_seen DESC"
+    rows = conn.execute(
+        f"SELECT id, hanzi, pinyin, times_seen, first_seen, last_seen, last_context FROM vocabulary ORDER BY {order} LIMIT ? OFFSET ?",
+        (max(1, min(limit, 200)), max(0, offset))
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
+    conn.close()
+    return JSONResponse({
+        "words": [dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@app.get("/api/vocab-quiz")
+async def vocab_quiz(count: int = 5):
+    _ensure_db()
+    conn = _get_db()
+    words = conn.execute(
+        "SELECT hanzi, pinyin FROM vocabulary ORDER BY RANDOM() LIMIT ?",
+        (max(1, min(count, 20)),)
+    ).fetchall()
+    conn.close()
+    if not words:
+        return JSONResponse({"quiz": [], "ok": False, "message": "No vocabulary tracked yet."})
+    quiz_items = []
+    for w in words:
+        quiz_items.append({"hanzi": w["hanzi"], "pinyin": w["pinyin"], "question": f"What is the pinyin for: {w['hanzi']}?"})
+    return JSONResponse({"quiz": quiz_items, "ok": True, "count": len(quiz_items)})
+
+
+@app.post("/api/vocab/track")
+async def vocab_track(request: Request):
+    _ensure_db()
+    body = await request.json()
+    words = body.get("words", [])
+    if not isinstance(words, list) or not words:
+        return JSONResponse({"tracked": 0})
+    conn = _get_db()
+    tracked = 0
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for word in words:
+        hanzi = clean_text(word.get("hanzi", ""))
+        pinyin_str = clean_text(word.get("pinyin", ""))
+        context = clean_text(word.get("context", ""))[:200]
+        if not hanzi or len(hanzi) > 20: continue
+        try:
+            conn.execute(
+                """INSERT INTO vocabulary (hanzi, pinyin, times_seen, first_seen, last_seen, last_context)
+                   VALUES (?, ?, 1, ?, ?, ?)
+                   ON CONFLICT(hanzi) DO UPDATE SET
+                   pinyin = CASE WHEN vocabulary.pinyin = '' THEN excluded.pinyin ELSE vocabulary.pinyin END,
+                   times_seen = vocabulary.times_seen + 1,
+                   last_seen = excluded.last_seen,
+                   last_context = excluded.last_context""",
+                (hanzi, pinyin_str, now, now, context))
+            tracked += 1
+        except Exception: pass
+    conn.commit()
+    conn.close()
+    return JSONResponse({"tracked": tracked})
+
+
+@app.delete("/api/vocab/{word_id}")
+async def vocab_delete(word_id: int):
+    _ensure_db()
+    conn = _get_db()
+    conn.execute("DELETE FROM vocabulary WHERE id = ?", (word_id,))
+    deleted = conn.total_changes
+    conn.commit()
+    conn.close()
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Word not found.")
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/vocab/clear")
+async def vocab_clear():
+    _ensure_db()
+    conn = _get_db()
+    conn.execute("DELETE FROM vocabulary")
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "deleted": True})
+
+
+@app.get("/api/vocab-test-simple")
+async def vocab_test_simple():
+    _ensure_db()
+    conn = _get_db()
+    rows = conn.execute("SELECT hanzi, pinyin FROM vocabulary LIMIT 10").fetchall()
+    conn.close()
+    return {"words": [dict(r) for r in rows], "ok": True}
+
+
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {
@@ -127,6 +251,11 @@ async def health() -> dict[str, Any]:
         "aiConfigured": bool(DEEPSEEK_API_KEY),
         "model": MODEL,
     }
+
+
+@app.get("/api/ping")
+async def ping():
+    return {"pong": True}
 
 
 @app.post("/api/tutor-turn-stream")
@@ -1622,107 +1751,6 @@ async def summarize_conversation(request: Request):
         return JSONResponse({"summary": summary[:400], "ok": True})
     except Exception:
         return JSONResponse({"summary": "", "ok": False})
-
-
-@app.post("/api/vocab/track")
-async def vocab_track(request: Request):
-    """Track vocabulary words seen in tutor responses."""
-    body = await request.json()
-    words = body.get("words", [])
-    if not isinstance(words, list) or not words:
-        return JSONResponse({"tracked": 0})
-    
-    conn = _get_db()
-    tracked = 0
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for word in words:
-        hanzi = clean_text(word.get("hanzi", ""))
-        pinyin_str = clean_text(word.get("pinyin", ""))
-        context = clean_text(word.get("context", ""))[:200]
-        if not hanzi or len(hanzi) > 20:
-            continue
-        try:
-            conn.execute(
-                """INSERT INTO vocabulary (hanzi, pinyin, times_seen, first_seen, last_seen, last_context)
-                   VALUES (?, ?, 1, ?, ?, ?)
-                   ON CONFLICT(hanzi) DO UPDATE SET
-                   pinyin = CASE WHEN vocabulary.pinyin = '' THEN excluded.pinyin ELSE vocabulary.pinyin END,
-                   times_seen = vocabulary.times_seen + 1,
-                   last_seen = excluded.last_seen,
-                   last_context = excluded.last_context""",
-                (hanzi, pinyin_str, now, now, context)
-            )
-            tracked += 1
-        except Exception:
-            pass
-    conn.commit()
-    conn.close()
-    return JSONResponse({"tracked": tracked})
-
-
-@app.get("/api/vocab")
-async def vocab_list(sort: str = "recent", limit: int = 50, offset: int = 0):
-    """Get vocabulary list."""
-    conn = _get_db()
-    order = "last_seen DESC" if sort == "recent" else "first_seen ASC" if sort == "oldest" else "times_seen DESC"
-    rows = conn.execute(
-        f"SELECT id, hanzi, pinyin, times_seen, first_seen, last_seen, last_context FROM vocabulary ORDER BY {order} LIMIT ? OFFSET ?",
-        (max(1, min(limit, 200)), max(0, offset))
-    ).fetchall()
-    total = conn.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
-    conn.close()
-    return JSONResponse({
-        "words": [dict(r) for r in rows],
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    })
-
-
-@app.delete("/api/vocab/{word_id}")
-async def vocab_delete(word_id: int):
-    """Delete a vocabulary entry."""
-    conn = _get_db()
-    conn.execute("DELETE FROM vocabulary WHERE id = ?", (word_id,))
-    deleted = conn.total_changes
-    conn.commit()
-    conn.close()
-    if deleted == 0:
-        raise HTTPException(status_code=404, detail="Word not found.")
-    return JSONResponse({"ok": True})
-
-
-@app.delete("/api/vocab")
-async def vocab_clear():
-    """Clear all vocabulary."""
-    conn = _get_db()
-    conn.execute("DELETE FROM vocabulary")
-    conn.commit()
-    conn.close()
-    return JSONResponse({"ok": True, "deleted": True})
-
-
-@app.get("/api/vocab/quiz")
-async def vocab_quiz(count: int = 5):
-    """Generate a simple vocab quiz from tracked words."""
-    conn = _get_db()
-    words = conn.execute(
-        "SELECT hanzi, pinyin FROM vocabulary ORDER BY RANDOM() LIMIT ?",
-        (max(1, min(count, 20)),)
-    ).fetchall()
-    conn.close()
-    if not words:
-        return JSONResponse({"quiz": [], "ok": False, "message": "No vocabulary tracked yet."})
-    
-    quiz_items = []
-    for w in words:
-        quiz_items.append({
-            "hanzi": w["hanzi"],
-            "pinyin": w["pinyin"],
-            "question": f"What is the pinyin for: {w['hanzi']}?",
-        })
-    return JSONResponse({"quiz": quiz_items, "ok": True, "count": len(quiz_items)})
-
 
 if __name__ == "__main__":
     import uvicorn

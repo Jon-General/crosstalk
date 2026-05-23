@@ -221,7 +221,7 @@ function App() {
 
   async function fetchVocab(sort) {
     try {
-      const res = await fetch(`/api/vocab?sort=${sort || vocabSort || "recent"}&limit=100`);
+      const res = await fetch(`/api/vocab-list?sort=${sort || vocabSort || "recent"}&limit=100`);
       if (res.ok) {
         const data = await res.json();
         setVocabData(data);
@@ -231,7 +231,7 @@ function App() {
 
   async function fetchQuiz() {
     try {
-      const res = await fetch("/api/vocab/quiz?count=8");
+      const res = await fetch("/api/vocab-quiz?count=8");
       const data = await res.json();
       setQuizItems(data.quiz || []);
       setQuizReveal({});
@@ -270,7 +270,7 @@ function App() {
   async function clearVocab() {
     if (!confirm("Delete all vocabulary?")) return;
     try {
-      await fetch("/api/vocab", { method: "DELETE" });
+      await fetch("/api/vocab/clear", { method: "DELETE" });
       setVocabData({ words: [], total: 0 });
     } catch {}
   }
